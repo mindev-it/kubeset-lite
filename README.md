@@ -89,3 +89,27 @@ spec:
 
 Per il resto si usa podman direttamente: `podman logs`, `podman exec`,
 `podman volume ls`.
+
+## Rollout: qualche secondo di disservizio
+
+`apply` e `restart` riavviano la unit del progetto: podman ferma il pod
+vecchio e poi avvia il nuovo, come la strategia `Recreate` di Kubernetes.
+In mezzo Caddy risponde 502. Il buco dura lo spegnimento del container
+(fino a `terminationGracePeriodSeconds`) più l'avvio dell'app: di solito
+pochi secondi. Uno script di deploy che dopo l'apply esegue le migration e
+fa `restart` ne ha due.
+
+Per un progetto a cui serve, ci sono tre strade, nessuna implementata:
+
+- **Caddy che aspetta**: `lb_try_duration 30s` nel `reverse_proxy` fa
+  riprovare Caddy per 30 secondi invece di dare 502. Le richieste durante
+  il riavvio diventano lente, non fallite.
+- **Migration in un `initContainer`**: podman li supporta, girano fino alla
+  fine prima del container dell'app. Toglie il secondo riavvio e vale
+  uguale su k3s.
+- **Zero downtime vero**: due unit su due porte, la nuova si avvia accanto
+  alla vecchia, Caddy passa alla nuova quando è pronta, poi la vecchia si
+  ferma. Podman da solo non lo fa. Funziona anche con SQLite, purché le due
+  copie stiano sullo stesso host e sullo stesso volume locale: i lock sul
+  file serializzano le scritture. SQLite non va messo su un filesystem di
+  rete.
