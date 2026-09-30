@@ -69,10 +69,20 @@ spec:
 - `imagePullPolicy` diventa `Never`: l'immagine scaricata all'apply resta e
   basta anche dopo un riavvio, senza credenziali.
 - La `readinessProbe` httpGet la usa solo `apply`/`restart` per attendere il
-  rollout, dalla porta pubblicata. Se il rollout fallisce entro 180 secondi
-  la unit viene fermata: podman non ha il CrashLoopBackOff.
-- Le `livenessProbe` httpGet vengono tolte: podman le eseguirebbe con curl
-  dentro il container.
+  rollout, dalla porta pubblicata. Se non risponde entro
+  `progressDeadlineSeconds` del Deployment (180 se manca) la unit viene
+  fermata: podman non ha il CrashLoopBackOff.
+- La `livenessProbe` deve essere `exec`: una httpGet viene rifiutata, perché
+  podman la eseguirebbe con curl dentro il container (in Kubernetes la fa il
+  kubelet da fuori). Forma comune a k3s e podman, per immagini con wget
+  (alpine e busybox lo hanno):
+
+  ```yaml
+  livenessProbe:
+    exec:
+      command: [wget, -q, --spider, -T, "4", "http://127.0.0.1:3000/health"]
+    timeoutSeconds: 5
+  ```
 - I PVC nascono con proprietario `runAsUser`/`fsGroup` del pod che li monta.
 - Le Secret si leggono con `kubeset-lt secret`: podman le cancella a ogni
   stop della unit e le ricrea dallo YAML salvato.

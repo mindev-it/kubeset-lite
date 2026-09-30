@@ -49,8 +49,10 @@ container_name() {
 
 # Attende che le readinessProbe httpGet rispondano sulle porte pubblicate.
 rollout() {
-    local name=$1 dir=$QUADLET/$1 deadline probes port path host
-    deadline=$((SECONDS + ROLLOUT_TIMEOUT))
+    local name=$1 dir=$QUADLET/$1 timeout deadline probes port path host
+    # Come in Kubernetes: progressDeadlineSeconds del Deployment, il più alto.
+    timeout=$(yq -s --argjson d "$ROLLOUT_TIMEOUT" '[.[] | .spec.progressDeadlineSeconds? // empty] | max // $d' "$dir/$name.yaml")
+    deadline=$((SECONDS + timeout))
     probes=$(yq -r '
         (.spec.template.spec? // .spec?) | .containers[]? | . as $c
         | ($c.readinessProbe.httpGet // empty) as $h
@@ -148,13 +150,12 @@ cmd_apply() {
 
     # Podman esegue una livenessProbe httpGet con curl dentro il container:
     # se l'immagine non ha curl, il container riparte all'infinito.
-    jq -r '.[] | .. | objects | select(has("image") and has("name") and .livenessProbe.httpGet?) | .name' "$docs" \
-        | while read -r c; do log "container $c: livenessProbe httpGet ignorata"; done
+    bad=$(jq -r '.[] | .. | objects | select(has("image") and has("name") and .livenessProbe.httpGet?) | .name' "$docs")
+    [ -z "$bad" ] || die "livenessProbe httpGet non supportata (container: $(echo $bad)): usa exec, per esempio [wget, -q, --spider, -T, \"4\", \"http://127.0.0.1:<porta>/<path>\"]"
 
     # Trasformazioni per podman:
     # - via Project e credenziali del registry;
     # - imagePullPolicy: Never, così dopo il pull non serve più il registry;
-    # - via le livenessProbe httpGet (vedi sopra);
     # - i PVC prendono uid/gid dal securityContext del pod che li monta,
     #   altrimenti podman crea il volume di root (vale solo alla creazione).
     jq '. as $all
@@ -171,9 +172,7 @@ cmd_apply() {
         | if .kind == "PersistentVolumeClaim" then
               .metadata.annotations = (($owners[.metadata.name] // {}) + (.metadata.annotations // {}))
           else . end
-        | walk(if type == "object" and has("image") and has("name") then
-              .imagePullPolicy = "Never" | if .livenessProbe.httpGet? then del(.livenessProbe) else . end
-          else . end)]' \
+        | walk(if type == "object" and has("image") and has("name") then .imagePullPolicy = "Never" else . end)]' \
         "$docs" > "$work/podman.json"
 
     # 2. Pull. Se fallisce non si è toccato niente.

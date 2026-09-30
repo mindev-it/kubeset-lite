@@ -101,9 +101,10 @@ invece è compito dello script di deploy del progetto (vedi agente psa).
 1. Legge stdin in una dir sotto `$XDG_RUNTIME_DIR`, trap di pulizia.
 2. Separa: `kind: Project`, Secret dockerconfigjson, resto per podman. Un
    kind che podman non supporta → errore esplicito (Namespace, Service,
-   Ingress e CronJob non devono arrivare). Ritocchi per podman: toglie le
-   `livenessProbe` httpGet (podman le esegue con curl dentro il container:
-   senza curl nell'immagine il container riparte all'infinito) e aggiunge ai
+   Ingress e CronJob non devono arrivare). Una `livenessProbe` httpGet →
+   errore: podman la esegue con curl dentro il container (senza curl
+   nell'immagine il container riparte all'infinito), quindi i progetti usano
+   `exec` con wget, che vale uguale su k3s. Ritocco per podman: aggiunge ai
    PVC le annotation `volume.podman.io/uid|gid` prese dal `securityContext`
    del pod che li monta (senza, il volume nasce di root).
 3. Pull con `DOCKER_CONFIG`. Se fallisce, esce senza toccare niente.
@@ -111,7 +112,8 @@ invece è compito dello script di deploy del progetto (vedi agente psa).
    `<project>.kube` con i `PublishPort`. Una sola unit per progetto.
 5. `daemon-reload`, restart di `<project>.service`.
 6. Rollout: se un container ha `readinessProbe.httpGet`, curl sulla porta
-   pubblicata fino a OK o timeout (180s). Altrimenti basta la unit attiva.
+   pubblicata fino a OK o timeout (`progressDeadlineSeconds` del Deployment,
+   180s se manca). Altrimenti basta la unit attiva.
 7. Solo dopo il rollout, i timer: scrive
    `~/.config/systemd/user/kubeset-lt-<project>_<cron>.{service,timer}`, cancella
    i `kubeset-lt-<project>_*` che non sono più nel documento, `enable --now`.
