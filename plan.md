@@ -4,8 +4,12 @@ Riferimenti: `idea.md` (il perché), `~/Work/Sys/web-server-orchestrator` (lo
 stile: `install.sh` idempotente, comandi in `/usr/bin`, niente demoni nostri),
 `~/Work/psa-car/backend` (primo progetto da migrare, primo server: host4).
 
+Nome: il progetto è kubeset-lite, ma comando, utente, percorsi e prefissi
+sono `kubeset-lt`. `kubeset` è riservato al progetto fratello su k3s (oggi
+kwo).
+
 Principio: semplicità assoluta. Bash, `yq`, `podman`, `systemd`, `caddy`.
-kubeset non reimplementa Kubernetes: passa a `podman kube play` solo i kind
+kubeset-lt non reimplementa Kubernetes: passa a `podman kube play` solo i kind
 che podman capisce, e per il resto (HTTPS, cron) legge un documento YAML suo.
 
 ## Tre famiglie di YAML nel repo del progetto
@@ -13,15 +17,15 @@ che podman capisce, e per il resto (HTTPS, cron) legge un documento YAML suo.
 - **Comuni a k3s e podman**: Deployment, PVC, Secret, ConfigMap, Job. Sono i
   file che esistono già in `deploy/k8s/` e non si toccano.
 - **Solo k3s**: Namespace, Service, Ingress, CronJob. Restano dove sono, li
-  usa solo `deploy.sh`. kubeset non li riceve.
-- **Solo kubeset**: `deploy/kubeset.yaml`, un documento `kind: Project` che
-  kubeset legge e scarta prima di chiamare podman.
+  usa solo `deploy.sh`. kubeset-lt non li riceve.
+- **Solo kubeset-lt**: `deploy/kubeset-lt.yaml`, un documento `kind: Project` che
+  kubeset-lt legge e scarta prima di chiamare podman.
 
 ```yaml
-apiVersion: kubeset-lite/v1
+apiVersion: kubeset-lt/v1
 kind: Project
 metadata:
-  name: psa                     # prefisso di tutto ciò che kubeset genera
+  name: psa                     # prefisso di tutto ciò che kubeset-lt genera
 spec:
   publish:                      # → PublishPort=127.0.0.1:<host>:<container>
     - "8081:3000"
@@ -52,29 +56,29 @@ Scelte:
 ## Interfaccia
 
 ```bash
-cat stream.yaml | ssh kubeset@host kubeset apply
-ssh kubeset@host kubeset restart <project>     # restart + attesa readiness
-ssh kubeset@host kubeset status [project]
-ssh kubeset@host kubeset secret <project> <name>  # la Secret com'è nello YAML applicato
-ssh kubeset@host kubeset delete <project>      # volumi esclusi
+cat stream.yaml | ssh kubeset-lt@host kubeset-lt apply
+ssh kubeset-lt@host kubeset-lt restart <project>     # restart + attesa readiness
+ssh kubeset-lt@host kubeset-lt status [project]
+ssh kubeset-lt@host kubeset-lt secret <project> <name>  # la Secret com'è nello YAML applicato
+ssh kubeset-lt@host kubeset-lt delete <project>      # volumi esclusi
 ```
 
 `stream.yaml` è un multi-document YAML già renderizzato dal deployer
 (envsubst lato client, come oggi) con esattamente un `kind: Project`.
 
 Per il resto si usa podman direttamente, niente wrapper:
-`podman logs`, `podman exec`. Le Secret invece si leggono con `kubeset
+`podman logs`, `podman exec`. Le Secret invece si leggono con `kubeset-lt
 secret`, perché podman le cancella a ogni stop della unit (vedi Verificato):
 la copia che conta è quella nello YAML su disco.
 
-Utente ssh: **`kubeset`** (rootless, home `/var/lib/kubeset`). Chi deploya
-deve già poter fare `ssh kubeset@host` col proprio agent.
+Utente ssh: **`kubeset-lt`** (rootless, home `/var/lib/kubeset-lt`). Chi deploya
+deve già poter fare `ssh kubeset-lt@host` col proprio agent.
 
 ## Credenziali del registry
 
 Solo temporanee. Il deployer le mette nello stream come Secret di tipo
 `kubernetes.io/dockerconfigjson` (una riga con `kubectl create secret
-docker-registry --dry-run=client -o yaml`). kubeset:
+docker-registry --dry-run=client -o yaml`). kubeset-lt:
 
 1. la toglie dallo stream e la scrive in `$XDG_RUNTIME_DIR` (tmpfs) come
    `.docker-tmp/config.json`, con trap che la cancella anche se lo script
@@ -92,7 +96,7 @@ quindi questa è anche l'unica strada che non lascia credenziali sul server.
 regole sull'età: resta solo l'immagine in uso. La pulizia del registry
 invece è compito dello script di deploy del progetto (vedi agente psa).
 
-## Cosa fa `kubeset apply`
+## Cosa fa `kubeset-lt apply`
 
 1. Legge stdin in una dir sotto `$XDG_RUNTIME_DIR`, trap di pulizia.
 2. Separa: `kind: Project`, Secret dockerconfigjson, resto per podman. Un
@@ -105,24 +109,24 @@ invece è compito dello script di deploy del progetto (vedi agente psa).
 6. Rollout: se un container ha `readinessProbe.httpGet`, curl sulla porta
    pubblicata fino a OK o timeout (180s). Altrimenti basta la unit attiva.
 7. Solo dopo il rollout, i timer: scrive
-   `~/.config/systemd/user/kubeset-<project>-<cron>.{service,timer}`, cancella
-   i `kubeset-<project>-*` che non sono più nel documento, `enable --now`.
+   `~/.config/systemd/user/kubeset-lt-<project>-<cron>.{service,timer}`, cancella
+   i `kubeset-lt-<project>-*` che non sono più nel documento, `enable --now`.
    Il prefisso col nome progetto è ciò che rende possibile il delete di un
    cron tolto.
-8. Caddy: `/var/lib/kubeset/caddy/<project>.caddy`; se cambiato,
+8. Caddy: `/var/lib/kubeset-lt/caddy/<project>.caddy`; se cambiato,
    `sudo systemctl reload caddy`.
 9. Prune delle immagini.
 
 ## Layout sul server
 
 ```
-/usr/bin/kubeset                          comando unico
-/etc/kubeset/kubeset.conf                 ACME_EMAIL, TLS (acme | internal)
-/etc/caddy/Caddyfile                      globali + import /var/lib/kubeset/caddy/*.caddy
-/etc/sudoers.d/kubeset                    kubeset → solo "systemctl reload caddy"
-/var/lib/kubeset/                         home dell'utente kubeset
-  .config/containers/systemd/<project>/   yaml + .kube
-  .config/systemd/user/kubeset-<project>-*  timer dei cron
+/usr/bin/kubeset-lt                           comando unico
+/etc/kubeset-lt/kubeset-lt.conf               ACME_EMAIL, TLS (acme | internal)
+/etc/caddy/Caddyfile                          globali + import /var/lib/kubeset-lt/caddy/*.caddy
+/etc/sudoers.d/kubeset-lt                     kubeset-lt → solo "systemctl reload caddy"
+/var/lib/kubeset-lt/                          home dell'utente kubeset-lt
+  .config/containers/systemd/<project>/       yaml + .kube
+  .config/systemd/user/kubeset-lt-<project>-* timer dei cron
   caddy/<project>.caddy
 ```
 
@@ -130,9 +134,9 @@ invece è compito dello script di deploy del progetto (vedi agente psa).
 
 - apt: `podman`, `uidmap`, `passt`, `yq`, `curl`, `jq`; Caddy dal repo
   ufficiale Cloudsmith (Ubuntu e Debian hanno la 2.6.2).
-- utente `kubeset` con home `/var/lib/kubeset`, `loginctl enable-linger`.
-- `authorized_keys` di kubeset: se vuoto, copia quello di `$SUDO_USER`.
-- Caddyfile e `kubeset.conf` creati solo se mancano. `/usr/bin/kubeset`
+- utente `kubeset-lt` con home `/var/lib/kubeset-lt`, `loginctl enable-linger`.
+- `authorized_keys` di kubeset-lt: se vuoto, copia quello di `$SUDO_USER`.
+- Caddyfile e `kubeset-lt.conf` creati solo se mancano. `/usr/bin/kubeset-lt`
   sovrascritto sempre.
 - sudoers validato con `visudo -c`.
 - firewall: se c'è un REJECT in INPUT (immagini Oracle), apre 80/443 in
@@ -140,7 +144,7 @@ invece è compito dello script di deploy del progetto (vedi agente psa).
 
 ## Verificato sulla VM di sviluppo (27/09)
 
-Podman 5.4.2, utente `kubeset` rootless:
+Podman 5.4.2, utente `kubeset-lt` rootless:
 
 - cgroup delegati all'utente: `cpu memory pids` → i limiti del manifest
   valgono.
@@ -157,7 +161,7 @@ Podman 5.4.2, utente `kubeset` rootless:
   fase 2 su un utente appena creato.
 - Attenzione: `restartPolicy: Always` di podman rilancia un container che
   crasha senza pausa (niente CrashLoopBackOff). Su 1/8 di OCPU un crash loop
-  pesa: se il rollout fallisce, kubeset ferma la unit.
+  pesa: se il rollout fallisce, kubeset-lt ferma la unit.
 
 ## Ambienti
 
@@ -169,7 +173,7 @@ Podman 5.4.2, utente `kubeset` rootless:
 
 ## Due agenti
 
-**Agente main (questo repo)**: `install.sh`, `bin/kubeset`, README, prove
+**Agente main (questo repo)**: `install.sh`, `bin/kubeset-lt`, README, prove
 sulla VM con manifest minimi.
 
 **Agente psa (`~/Work/psa-car/backend`)**:
@@ -180,7 +184,7 @@ sulla VM con manifest minimi.
   `dev`. Tocca il remote: si fa solo con conferma.
 - `deploy.sh` e `deploy/k8s/` intatti (a parte `GIT_BRANCH` dopo la
   rinomina, se si vuole che l'originale funzioni ancora). Nuovi:
-  `deploy-kubeset-lite.sh` e `deploy/kubeset.yaml`.
+  `deploy-kubeset-lite.sh` e `deploy/kubeset-lt.yaml`.
 - Passi git come `deploy.sh` di hail: working tree pulito, offerta di
   allineare `main` a `dev`, build solo da `origin/main` via `git archive`.
 - Bitwarden come da skill `backend-development` (punto 5): una sola
@@ -201,24 +205,24 @@ sulla VM con manifest minimi.
 - Dopo il push riuscito: API Scaleway (`X-Auth-Token` = la stessa secret
   key del registry) → lista dei tag dell'immagine per data, cancellazione di
   tutti tranne i 3 più recenti. Solo curl e jq.
-- Secret `psa-backend-secrets`: riusa se esiste (`kubeset secret psa
+- Secret `psa-backend-secrets`: riusa se esiste (`kubeset-lt secret psa
   psa-backend-secrets` via ssh), altrimenti genera con openssl come oggi.
 - Stream: `pvc.yaml`, `deployment.yaml` (envsubst), Secret dell'app, Secret
-  dockerconfigjson, `kubeset.yaml` (envsubst) → `kubeset apply`.
+  dockerconfigjson, `kubeset-lt.yaml` (envsubst) → `kubeset-lt apply`.
 - Migration come oggi: `podman exec psa-backend-pod-api node
-  dist/db/migrate.js` via ssh, poi `kubeset restart psa`.
-- Target in variabile (`TARGET=kubeset@host4.net.mindev.it`, override per la
+  dist/db/migrate.js` via ssh, poi `kubeset-lt restart psa`.
+- Target in variabile (`TARGET=kubeset-lt@host4.net.mindev.it`, override per la
   VM).
 - Ultima fase, con conferma: copia di `psa.db` dal PVC su host2 al volume su
   host4 e cambio DNS di `psa-controller.chdev.eu`.
 
-Se `deploy/k8s/*.yaml` non passa da podman, è un bug di kubeset: si segnala
+Se `deploy/k8s/*.yaml` non passa da podman, è un bug di kubeset-lt: si segnala
 all'agente main, non si modifica il manifest.
 
 ## Fasi
 
 1. `install.sh` sulla VM.
-2. `kubeset apply` / `restart` / `status` / `delete` con un progetto di prova:
+2. `kubeset-lt apply` / `restart` / `status` / `delete` con un progetto di prova:
    pull con credenziali temporanee, porta, Caddy, readiness, prune.
    Sopravvive a `reboot` senza credenziali.
 3. Cron → timer, compresa la rimozione di un cron tolto dal documento.
@@ -231,8 +235,8 @@ all'agente main, non si modifica il manifest.
 - Piano chiuso, nessuna domanda aperta. Codice non ancora scritto.
 - VM di sviluppo: installati a mano `podman`, `uidmap`, `passt`, `curl`;
   creato l'utente `kubeset` (home `/var/lib/kubeset`, linger attivo,
-  `authorized_keys` copiato da root). Nessun progetto attivo. `install.sh`
-  deve ritrovarli e andare avanti senza errori.
+  `authorized_keys` copiato da root), col vecchio nome: va rimosso prima di
+  `install.sh`, che crea `kubeset-lt`. Nessun progetto attivo.
 - host4: non toccato (niente podman, niente Caddy, utente `ubuntu` con sudo).
 - psa-car: non toccato, ancora su `master`.
 - Prossimo passo: avviare i due agenti (main su questo repo dalla fase 1,
