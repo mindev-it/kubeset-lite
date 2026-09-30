@@ -101,7 +101,11 @@ invece è compito dello script di deploy del progetto (vedi agente psa).
 1. Legge stdin in una dir sotto `$XDG_RUNTIME_DIR`, trap di pulizia.
 2. Separa: `kind: Project`, Secret dockerconfigjson, resto per podman. Un
    kind che podman non supporta → errore esplicito (Namespace, Service,
-   Ingress e CronJob non devono arrivare).
+   Ingress e CronJob non devono arrivare). Ritocchi per podman: toglie le
+   `livenessProbe` httpGet (podman le esegue con curl dentro il container:
+   senza curl nell'immagine il container riparte all'infinito) e aggiunge ai
+   PVC le annotation `volume.podman.io/uid|gid` prese dal `securityContext`
+   del pod che li monta (senza, il volume nasce di root).
 3. Pull con `DOCKER_CONFIG`. Se fallisce, esce senza toccare niente.
 4. Scrive `~/.config/containers/systemd/<project>/<project>.yaml` (600) e
    `<project>.kube` con i `PublishPort`. Una sola unit per progetto.
@@ -109,10 +113,11 @@ invece è compito dello script di deploy del progetto (vedi agente psa).
 6. Rollout: se un container ha `readinessProbe.httpGet`, curl sulla porta
    pubblicata fino a OK o timeout (180s). Altrimenti basta la unit attiva.
 7. Solo dopo il rollout, i timer: scrive
-   `~/.config/systemd/user/kubeset-lt-<project>-<cron>.{service,timer}`, cancella
-   i `kubeset-lt-<project>-*` che non sono più nel documento, `enable --now`.
+   `~/.config/systemd/user/kubeset-lt-<project>_<cron>.{service,timer}`, cancella
+   i `kubeset-lt-<project>_*` che non sono più nel documento, `enable --now`.
    Il prefisso col nome progetto è ciò che rende possibile il delete di un
-   cron tolto.
+   cron tolto; il `_` non è ammesso nei nomi di progetto, quindi `psa` non
+   tocca i cron di `psa-x`.
 8. Caddy: `/var/lib/kubeset-lt/caddy/<project>.caddy`; se cambiato,
    `sudo systemctl reload caddy`.
 9. Prune delle immagini.
@@ -126,7 +131,7 @@ invece è compito dello script di deploy del progetto (vedi agente psa).
 /etc/sudoers.d/kubeset-lt                     kubeset-lt → solo "systemctl reload caddy"
 /var/lib/kubeset-lt/                          home dell'utente kubeset-lt
   .config/containers/systemd/<project>/       yaml + .kube
-  .config/systemd/user/kubeset-lt-<project>-* timer dei cron
+  .config/systemd/user/kubeset-lt-<project>_* timer dei cron
   caddy/<project>.caddy
 ```
 
@@ -154,11 +159,16 @@ Podman 5.4.2, utente `kubeset-lt` rootless:
 - `envFrom.secretRef` su una Secret dello stesso YAML funziona. Allo stop
   della unit podman cancella la Secret e la ricrea allo start dallo YAML; il
   volume invece resta.
-- Volume: podman assegna da solo il volume nuovo e vuoto all'utente del
-  container (`runAsUser: 1000` → proprietario 1000), con o senza annotation,
-  in 4 prove su 4. Niente traduzione di `fsGroup`. Una quinta prova, la
-  primissima, ha dato proprietario root: non riprodotta, da ricontrollare in
-  fase 2 su un utente appena creato.
+- Volume: sull'utente appena creato (30/09) il volume nuovo è nato di root
+  (0:0), come nella primissima prova del 27/09, e il container con
+  `runAsUser: 1000` non ci scriveva. Con le annotation `volume.podman.io/uid`
+  e `gid` messe da kubeset-lt nasce 1000:1000. Valgono solo alla creazione:
+  un volume già esistente con il proprietario sbagliato va sistemato a mano
+  (`podman unshare chown`).
+- `livenessProbe` httpGet → healthcheck `curl -f http://localhost:<porta>`
+  dentro il container, con riavvio a ogni fallimento: con busybox (niente
+  curl) 9 riavvii in 3 minuti. La `readinessProbe` podman la ignora; la usa
+  solo il rollout di kubeset-lt, da fuori.
 - Attenzione: `restartPolicy: Always` di podman rilancia un container che
   crasha senza pausa (niente CrashLoopBackOff). Su 1/8 di OCPU un crash loop
   pesa: se il rollout fallisce, kubeset-lt ferma la unit.
@@ -230,14 +240,33 @@ all'agente main, non si modifica il manifest.
 5. `install.sh` su host4, deploy di psa.
 6. Migrazione dati e DNS di psa.
 
-## Stato al 27/09
+## Stato al 30/09
 
-- Piano chiuso, nessuna domanda aperta. Codice non ancora scritto.
-- VM di sviluppo: installati a mano `podman`, `uidmap`, `passt`, `curl`;
-  creato l'utente `kubeset` (home `/var/lib/kubeset`, linger attivo,
-  `authorized_keys` copiato da root), col vecchio nome: va rimosso prima di
-  `install.sh`, che crea `kubeset-lt`. Nessun progetto attivo.
-- host4: non toccato (niente podman, niente Caddy, utente `ubuntu` con sudo).
-- psa-car: non toccato, ancora su `master`.
-- Prossimo passo: avviare i due agenti (main su questo repo dalla fase 1,
-  psa su `~/Work/psa-car/backend`).
+- Fasi 1-3 fatte e provate sulla VM con un progetto di prova (busybox da un
+  registry locale con password su `localhost:5000`):
+  - `install.sh`: prima installazione e rilancio senza errori;
+  - `apply`: pull con credenziali temporanee, nessun file di credenziali sul
+    server;
+  - HTTPS via Caddy con `TLS=internal`;
+  - aggiornamento di immagine e Secret, con prune della versione precedente;
+  - `secret`: codice di uscita 0 se c'è, 2 se non c'è;
+  - pull fallito: esce senza toccare niente e il sito resta su;
+  - readinessProbe che non risponde: la unit viene fermata dopo 180 secondi;
+  - cron aggiunto e tolto;
+  - `timeout` del cron: uccide anche il processo dentro il container;
+  - `restart` e `delete` funzionano;
+  - dopo il `reboot` il progetto riparte senza credenziali.
+- VM di sviluppo:
+  - resta l'utente `kubeset` del 27/09 (uid 1000), da rimuovere a mano;
+  - `/etc/kubeset-lt/kubeset-lt.conf` ha `TLS=internal`;
+  - il registry di prova gira come root (container `testreg`, registries.conf
+    in `/etc/containers/registries.conf.d/testreg.conf`);
+  - il progetto `prova` è attivo.
+- psa-car: `deploy-kubeset-lite.sh` e `deploy/kubeset-lt.yaml` scritti e non
+  committati, repo ancora su `master`. Mai eseguiti: servono Bitwarden,
+  la build e il push su Scaleway.
+- Da chiarire: il dominio del registry Scaleway. La doc usa
+  `rg.<regione>.scw.cloud`, l'item Bitwarden aveva `rg.it-mil.scw.eu`.
+  Resta da verificare anche se l'API Registry risponde sulla regione
+  `it-mil`.
+- host4: non toccato.

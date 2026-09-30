@@ -1,0 +1,346 @@
+#!/bin/bash
+# kubeset-lt: esegue con podman kube play gli YAML Kubernetes di un progetto,
+# con Caddy davanti e i cron come timer systemd. Gira come utente kubeset-lt.
+#
+#   cat stream.yaml | kubeset-lt apply
+#   kubeset-lt restart <project>
+#   kubeset-lt status [project]
+#   kubeset-lt secret <project> <name>
+#   kubeset-lt delete <project>
+
+set -euo pipefail
+
+CONF=/etc/kubeset-lt/kubeset-lt.conf
+QUADLET=$HOME/.config/containers/systemd
+UNITS=$HOME/.config/systemd/user
+CADDY=$HOME/caddy
+ROLLOUT_TIMEOUT=180
+PODMAN_KINDS='["Pod","Deployment","DaemonSet","Job","PersistentVolumeClaim","ConfigMap","Secret"]'
+
+ACME_EMAIL=
+TLS=acme
+[ -f "$CONF" ] && . "$CONF"
+
+log() { echo "kubeset-lt: $*" >&2; }
+die() { log "$*"; exit 1; }
+
+check_name() {
+    [[ "$1" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || die "nome non valido: '$1'"
+}
+
+project_dir() {
+    check_name "$1"
+    [ -f "$QUADLET/$1/$1.kube" ] || die "progetto '$1' non trovato"
+    echo "$QUADLET/$1"
+}
+
+# "deployment/container" → nome del container creato da podman kube play.
+container_name() {
+    local docs=$1 target=$2 owner container kind
+    owner=${target%%/*}
+    container=${target#*/}
+    kind=$(jq -r --arg n "$owner" '.[] | select(.metadata.name==$n and (.kind=="Deployment" or .kind=="Pod")) | .kind' "$docs")
+    case "$kind" in
+        Deployment) echo "$owner-pod-$container" ;;
+        Pod) echo "$owner-$container" ;;
+        *) die "exec: '$owner' non è un Deployment o un Pod dello stream" ;;
+    esac
+}
+
+# Attende che le readinessProbe httpGet rispondano sulle porte pubblicate.
+rollout() {
+    local name=$1 dir=$QUADLET/$1 deadline probes port path host
+    deadline=$((SECONDS + ROLLOUT_TIMEOUT))
+    probes=$(yq -r '
+        (.spec.template.spec? // .spec?) | .containers[]? | . as $c
+        | ($c.readinessProbe.httpGet // empty) as $h
+        | ($h.port | if type == "number" then . else (. as $n | $c.ports[] | select(.name == $n) | .containerPort) end) as $p
+        | "\($p) \($h.path // "/")"' "$dir/$name.yaml")
+
+    while read -r port path; do
+        [ -n "$port" ] || continue
+        host=$(jq -r --arg p "$port" '.spec.publish[]? | select(endswith(":" + $p)) | split(":")[0]' "$dir/project.json" | head -1)
+        if [ -z "$host" ]; then
+            log "readinessProbe sulla porta $port non pubblicata, non la controllo"
+            continue
+        fi
+        log "attendo http://127.0.0.1:$host$path"
+        until curl -fsS -o /dev/null --max-time 5 "http://127.0.0.1:$host$path" 2>/dev/null; do
+            if systemctl --user -q is-failed "$name.service" || [ $SECONDS -ge $deadline ]; then
+                journalctl --user -u "$name.service" -n 30 --no-pager >&2 || true
+                systemctl --user stop "$name.service"
+                die "rollout di '$name' fallito: unit fermata"
+            fi
+            sleep 2
+        done
+    done <<< "$probes"
+
+    systemctl --user -q is-active "$name.service" || die "rollout di '$name' fallito: unit non attiva"
+    log "$name pronto"
+}
+
+reload_caddy() {
+    sudo -n systemctl reload caddy
+}
+
+# Rimuove le immagini che nessun progetto usa più.
+prune_images() {
+    local keep id ref
+    podman image prune -f >/dev/null
+    keep=$(for f in "$QUADLET"/*/*.yaml; do
+        [ -f "$f" ] || continue
+        yq -r '.. | objects | select(has("image") and has("name")) | .image' "$f"
+    done | sort -u | xargs -r podman image inspect --format '{{.Id}}' 2>/dev/null || true)
+    podman images --no-trunc --format '{{.ID}} {{.Repository}}:{{.Tag}}' | while read -r id ref; do
+        case "$ref" in
+            "<none>:<none>"|localhost/podman-pause:*) continue ;;
+        esac
+        grep -qxF "${id#sha256:}" <<< "${keep//sha256:/}" && continue
+        log "rimuovo l'immagine $ref"
+        podman rmi "$ref" >/dev/null || true
+    done
+}
+
+cmd_apply() {
+    local work name dir docs images img cron on exec_target timeout container cmd unit caddy_file sites
+
+    work=$(mktemp -d -p "${XDG_RUNTIME_DIR:?manca XDG_RUNTIME_DIR}" kubeset-lt.XXXXXX)
+    trap "rm -rf '$work'" EXIT
+    umask 077
+
+    # 1. Lettura e separazione dello stream.
+    cat > "$work/stream.yaml"
+    docs=$work/docs.json
+    yq -s '[.[] | select(. != null)]' "$work/stream.yaml" > "$docs" || die "stream YAML non valido"
+
+    [ "$(jq '[.[] | select(.kind == "Project")] | length' "$docs")" = 1 ] \
+        || die "serve esattamente un documento kind: Project"
+    jq '.[] | select(.kind == "Project")' "$docs" > "$work/project.json"
+    name=$(jq -r '.metadata.name' "$work/project.json")
+    check_name "$name"
+
+    bad=$(jq -r --argjson ok "$PODMAN_KINDS" '.[] | select(.kind != "Project" and (.kind as $k | $ok | index($k) | not)) | .kind' "$docs")
+    [ -z "$bad" ] || die "kind non supportati: $(echo $bad)"
+
+    jq -r '.spec.publish[]? // empty' "$work/project.json" | while read -r p; do
+        [[ "$p" =~ ^[0-9]+:[0-9]+$ ]] || die "publish non valido: '$p' (serve host:container)"
+    done
+    jq -r '.spec.sites // {} | to_entries[] | .value' "$work/project.json" | while read -r p; do
+        [[ "$p" =~ ^[0-9]+$ ]] || die "sites: porta non valida '$p'"
+    done
+
+    # Cron: tutto validato prima di toccare qualsiasi cosa.
+    jq -c '.spec.cron // {} | to_entries[]' "$work/project.json" > "$work/cron.jsonl"
+    while read -r cron; do
+        c=$(jq -r '.key' <<< "$cron")
+        [[ "$c" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || die "nome cron non valido: '$c'"
+        on=$(jq -r '.value.on // empty' <<< "$cron")
+        systemd-analyze calendar "$on" >/dev/null 2>&1 || die "cron $c: on non valido: '$on'"
+        exec_target=$(jq -r '.value.exec // empty' <<< "$cron")
+        [ -n "$exec_target" ] || die "cron $c: manca exec"
+        container_name "$docs" "${exec_target%% *}" >/dev/null
+    done < "$work/cron.jsonl"
+
+    # Credenziali del registry: solo in $work, cancellate dal trap.
+    mkdir -p "$work/docker"
+    jq -r '.[] | select(.kind == "Secret" and .type == "kubernetes.io/dockerconfigjson") | .data[".dockerconfigjson"] | @base64d' "$docs" \
+        > "$work/docker/config.json"
+
+    # Podman esegue una livenessProbe httpGet con curl dentro il container:
+    # se l'immagine non ha curl, il container riparte all'infinito.
+    jq -r '.[] | .. | objects | select(has("image") and has("name") and .livenessProbe.httpGet?) | .name' "$docs" \
+        | while read -r c; do log "container $c: livenessProbe httpGet ignorata"; done
+
+    # Trasformazioni per podman:
+    # - via Project e credenziali del registry;
+    # - imagePullPolicy: Never, così dopo il pull non serve più il registry;
+    # - via le livenessProbe httpGet (vedi sopra);
+    # - i PVC prendono uid/gid dal securityContext del pod che li monta,
+    #   altrimenti podman crea il volume di root (vale solo alla creazione).
+    jq '. as $all
+        | ([$all[] | (.spec.template.spec? // .spec?) | objects
+            | (.securityContext // {}) as $sc
+            | .volumes[]? | select(.persistentVolumeClaim)
+            | {key: .persistentVolumeClaim.claimName,
+               value: ({}
+                   + (if $sc.runAsUser != null then {"volume.podman.io/uid": ($sc.runAsUser | tostring)} else {} end)
+                   + (($sc.fsGroup // $sc.runAsGroup) as $g | if $g != null then {"volume.podman.io/gid": ($g | tostring)} else {} end))}
+          ] | from_entries) as $owners
+        | [.[]
+        | select(.kind != "Project" and (.kind != "Secret" or .type != "kubernetes.io/dockerconfigjson"))
+        | if .kind == "PersistentVolumeClaim" then
+              .metadata.annotations = (($owners[.metadata.name] // {}) + (.metadata.annotations // {}))
+          else . end
+        | walk(if type == "object" and has("image") and has("name") then
+              .imagePullPolicy = "Never" | if .livenessProbe.httpGet? then del(.livenessProbe) else . end
+          else . end)]' \
+        "$docs" > "$work/podman.json"
+
+    # 2. Pull. Se fallisce non si è toccato niente.
+    images=$(jq -r '[.[] | .. | objects | select(has("image") and has("name")) | .image] | unique | .[]' "$work/podman.json")
+    for img in $images; do
+        log "pull $img"
+        if [ -s "$work/docker/config.json" ]; then
+            DOCKER_CONFIG=$work/docker podman pull -q "$img" >/dev/null
+        else
+            podman pull -q "$img" >/dev/null
+        fi
+    done
+    rm -rf "$work/docker"
+
+    # 3. Quadlet: una unit per progetto.
+    dir=$QUADLET/$name
+    mkdir -p "$dir"
+    yq -y '.[]' "$work/podman.json" > "$dir/$name.yaml"
+    cp "$work/project.json" "$dir/project.json"
+    {
+        echo "[Unit]"
+        echo "Description=kubeset-lt $name"
+        echo
+        echo "[Kube]"
+        echo "Yaml=$name.yaml"
+        jq -r '.spec.publish[]? | "PublishPort=127.0.0.1:" + .' "$work/project.json"
+        echo
+        echo "[Install]"
+        echo "WantedBy=default.target"
+    } > "$dir/$name.kube"
+
+    systemctl --user daemon-reload
+    log "avvio $name.service"
+    systemctl --user restart "$name.service"
+    rollout "$name"
+
+    # 4. Cron, solo dopo un rollout riuscito.
+    mkdir -p "$UNITS"
+    local wanted=" "
+    while read -r cron; do
+        c=$(jq -r '.key' <<< "$cron")
+        on=$(jq -r '.value.on' <<< "$cron")
+        exec_target=$(jq -r '.value.exec' <<< "$cron")
+        timeout=$(jq -r '.value.timeout // "infinity"' <<< "$cron")
+        container=$(container_name "$docs" "${exec_target%% *}")
+        cmd=${exec_target#* }
+        unit=kubeset-lt-${name}_$c
+        wanted+="$unit "
+        cat > "$UNITS/$unit.service" <<EOF
+[Unit]
+Description=kubeset-lt $name cron $c
+After=$name.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/podman exec $container ${cmd//%/%%}
+TimeoutStartSec=$timeout
+EOF
+        cat > "$UNITS/$unit.timer" <<EOF
+[Unit]
+Description=kubeset-lt $name cron $c
+
+[Timer]
+OnCalendar=$on
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
+EOF
+    done < "$work/cron.jsonl"
+
+    for f in "$UNITS/kubeset-lt-${name}_"*.timer; do
+        [ -f "$f" ] || continue
+        unit=$(basename "$f" .timer)
+        [[ "$wanted" == *" $unit "* ]] && continue
+        log "rimuovo il cron $unit"
+        systemctl --user disable --now "$unit.timer" 2>/dev/null || true
+        rm -f "$UNITS/$unit.timer" "$UNITS/$unit.service"
+    done
+    systemctl --user daemon-reload
+    for unit in $wanted; do
+        systemctl --user enable -q "$unit.timer"
+        systemctl --user restart "$unit.timer"
+    done
+
+    # 5. Caddy.
+    caddy_file=$CADDY/$name.caddy
+    sites=$(jq -r --arg tls "$TLS" --arg email "$ACME_EMAIL" '.spec.sites // {} | to_entries[] |
+        "\(.key) {\n" +
+        (if $tls == "internal" then "\ttls internal\n" elif $email != "" then "\ttls \($email)\n" else "" end) +
+        "\treverse_proxy 127.0.0.1:\(.value)\n}\n"' "$work/project.json")
+    if [ -z "$sites" ]; then
+        if [ -f "$caddy_file" ]; then
+            rm -f "$caddy_file"
+            reload_caddy
+        fi
+    elif [ "$sites" != "$(cat "$caddy_file" 2>/dev/null)" ]; then
+        [ -f "$caddy_file" ] && cp "$caddy_file" "$work/caddy.old"
+        umask 022
+        printf '%s\n' "$sites" > "$caddy_file"
+        log "ricarico Caddy"
+        if ! reload_caddy; then
+            if [ -f "$work/caddy.old" ]; then cp "$work/caddy.old" "$caddy_file"; else rm -f "$caddy_file"; fi
+            reload_caddy || true
+            die "Caddy ha rifiutato la configurazione: ripristinata la precedente"
+        fi
+    fi
+
+    # 6. Pulizia immagini.
+    prune_images
+    log "apply di $name completato"
+}
+
+cmd_restart() {
+    local name=$1
+    project_dir "$name" >/dev/null
+    systemctl --user restart "$name.service"
+    rollout "$name"
+}
+
+cmd_status() {
+    local dir name
+    for dir in "$QUADLET"/*/; do
+        name=$(basename "$dir")
+        [ -f "$dir/$name.kube" ] || continue
+        [ -z "${1:-}" ] || [ "$1" = "$name" ] || continue
+        echo "$name: $(systemctl --user is-active "$name.service" || true)"
+        systemctl --user list-timers --all --no-pager --no-legend "kubeset-lt-${name}_*" | sed 's/^/  /'
+    done
+    echo
+    podman ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'
+}
+
+# Esce con 2 se la Secret non c'è: chi deploya distingue "da generare" da
+# "errore".
+cmd_secret() {
+    local dir out
+    dir=$(project_dir "$1" 2>/dev/null) || exit 2
+    out=$(yq -y --arg n "$2" 'select(.kind == "Secret" and .metadata.name == $n)' "$dir/$1.yaml")
+    [ -n "$out" ] || exit 2
+    echo "$out"
+}
+
+cmd_delete() {
+    local name=$1 f
+    project_dir "$name" >/dev/null
+    systemctl --user stop "$name.service" || true
+    for f in "$UNITS/kubeset-lt-${name}_"*.timer; do
+        [ -f "$f" ] || continue
+        systemctl --user disable --now "$(basename "$f")" 2>/dev/null || true
+        rm -f "$f" "${f%.timer}.service"
+    done
+    rm -rf "${QUADLET:?}/$name"
+    systemctl --user daemon-reload
+    if [ -f "$CADDY/$name.caddy" ]; then
+        rm -f "$CADDY/$name.caddy"
+        reload_caddy
+    fi
+    prune_images
+    log "$name rimosso (i volumi restano: podman volume ls)"
+}
+
+case "${1:-}" in
+    apply) cmd_apply ;;
+    restart) [ $# -eq 2 ] || die "uso: kubeset-lt restart <project>"; cmd_restart "$2" ;;
+    status) cmd_status "${2:-}" ;;
+    secret) [ $# -eq 3 ] || die "uso: kubeset-lt secret <project> <name>"; cmd_secret "$2" "$3" ;;
+    delete) [ $# -eq 2 ] || die "uso: kubeset-lt delete <project>"; cmd_delete "$2" ;;
+    *) die "uso: kubeset-lt apply|restart|status|secret|delete" ;;
+esac
