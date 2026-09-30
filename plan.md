@@ -258,17 +258,22 @@ all'agente main, non si modifica il manifest.
   - `timeout` del cron: uccide anche il processo dentro il container;
   - `restart` e `delete` funzionano;
   - dopo il `reboot` il progetto riparte senza credenziali.
+- `livenessProbe` httpGet rifiutata, timeout del rollout da
+  `progressDeadlineSeconds`: provati sulla VM.
+- Fase 4 fatta: psa deployato sulla VM con `deploy-kubeset-lite.sh`:
+  - push su `rg.it-mil.scw.eu` (dominio confermato da Scaleway), l'API
+    Registry risponde su `it-mil`;
+  - container healthy con la sonda `wget`, limiti 256Mi e 500m applicati;
+  - volume 1000:1000, migration eseguite;
+  - cron `poll-charging-monitors` eseguito con successo;
+  - HTTPS via Caddy risponde 200.
+- psa-car: `master` rinominato `main` su GitHub, creato `dev`. `deploy.sh`
+  ha ancora `GIT_BRANCH="master"`: non funziona finché non si cambia.
 - VM di sviluppo:
-  - resta l'utente `kubeset` del 27/09 (uid 1000), da rimuovere a mano;
   - `/etc/kubeset-lt/kubeset-lt.conf` ha `TLS=internal`;
   - il registry di prova gira come root (container `testreg`, registries.conf
     in `/etc/containers/registries.conf.d/testreg.conf`);
-  - il progetto `prova` è attivo.
-- psa-car: `deploy-kubeset-lite.sh` e `deploy/kubeset-lt.yaml` scritti e non
-  committati, repo ancora su `master`. Mai eseguiti: servono Bitwarden,
-  la build e il push su Scaleway.
-- Da chiarire: il dominio del registry Scaleway. La doc usa
-  `rg.<regione>.scw.cloud`, l'item Bitwarden aveva `rg.it-mil.scw.eu`.
-  Resta da verificare anche se l'API Registry risponde sulla regione
-  `it-mil`.
+  - attivo solo `psa`, con una Secret generata sulla VM (non quella di host2).
+- Da provare: un secondo deploy di psa, per vedere la Secret riusata e la
+  pulizia del registry con più di tre tag.
 - host4: non toccato.
