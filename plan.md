@@ -276,4 +276,21 @@ all'agente main, non si modifica il manifest.
   - attivo solo `psa`, con una Secret generata sulla VM (non quella di host2).
 - Da provare: un secondo deploy di psa, per vedere la Secret riusata e la
   pulizia del registry con più di tre tag.
-- host4: non toccato.
+- Fase 5 fatta: `install.sh` su host4 (Ubuntu 26.04, podman 5.7, repo
+  clonato da GitHub in `/home/ubuntu/kubeset-lite`), deploy di psa.
+- Fase 6 fatta (30/09):
+  - host2: Deployment a 0 e CronJob sospesi, niente cancellato (serve per
+    tornare indietro);
+  - `psa.db` copiato da host2 al volume di host4, sha256 identico;
+  - Secret `psa-backend-secrets` di host2 messa nello YAML applicato su host4
+    (confronto solo per hash);
+  - DNS di `psa-controller.chdev.eu` su host4, certificato Let's Encrypt
+    ottenuto dopo un `reload` di Caddy;
+  - primo cron sui dati veri: ha letto un monitor e interrogato l'API PSA.
+- Restano:
+  - host2: namespace `psa` da cancellare quando si è sicuri;
+  - host4: `~/psa-data-host4-iniziale.tar` (DB vuoto del primo deploy) da
+    cancellare;
+  - psa: `deploy.sh` (k3s) non funziona più finché non si cambia
+    `GIT_BRANCH` in `main`;
+  - skill per i DNS OVH, con chiavi lette all'occorrenza.
