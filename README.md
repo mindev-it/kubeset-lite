@@ -32,14 +32,14 @@ cat stream.yaml | ssh kubeset-lt@host kubeset-lt apply
 ssh kubeset-lt@host kubeset-lt restart <project>
 ssh kubeset-lt@host kubeset-lt status [project]
 ssh kubeset-lt@host kubeset-lt secret <project> <name>   # 2 se non esiste
-ssh kubeset-lt@host kubeset-lt delete <project>          # i volumi restano
+ssh kubeset-lt@host kubeset-lt delete <project>          # i volumi dei PVC restano
 ```
 
 `stream.yaml` è un multi-document YAML già renderizzato da chi deploya, con:
 
 - i manifest che podman capisce: Deployment, Pod, DaemonSet, Job,
-  PersistentVolumeClaim, ConfigMap, Secret. Namespace, Service, Ingress e
-  CronJob non devono esserci;
+  PersistentVolumeClaim, ConfigMap, Secret (Job e DaemonSet diventano Pod,
+  vedi sotto). Namespace, Service, Ingress e CronJob non devono esserci;
 - facoltativa, una Secret `kubernetes.io/dockerconfigjson` con le credenziali
   del registry: serve solo al pull e non resta sul server;
 - esattamente un documento `kind: Project`:
@@ -61,7 +61,7 @@ spec:
       timeout: 240s
 ```
 
-`exec` è `<deployment>/<container> <comando>`: il comando gira con
+`exec` è `<deployment o pod>/<container> <comando>`: il comando gira con
 `podman exec` dentro il container già attivo.
 
 ## Cosa cambia rispetto a Kubernetes
@@ -85,10 +85,45 @@ spec:
   ```
 - I PVC nascono con proprietario `runAsUser`/`fsGroup` del pod che li monta.
 - Le Secret si leggono con `kubeset-lt secret`: podman le cancella a ogni
-  stop della unit e le ricrea dallo YAML salvato.
+  stop della unit e le ricrea dallo YAML salvato. Una Secret montata come
+  file invece diventa un volume con il suo nome, riscritto a ogni avvio, che
+  resta su disco in chiaro anche a unit ferma. Lo stesso per le ConfigMap
+  montate. `delete` cancella questi volumi, non quelli dei PVC.
+- Job e DaemonSet diventano Pod (`spec` = `spec.template.spec`, label e
+  annotation dell'oggetto e del template). Quadlet chiama `podman kube play
+  --service-container=true`, che crea il service container solo per Pod e
+  Deployment: con un Job o un DaemonSet podman va in panic e la unit non
+  parte (bug di podman, c'è ancora in 5.7). Lo YAML resta quello di k3s.
+  Conseguenze:
+  - il container si chiama `<nome>-<container>` (un Deployment invece
+    `<nome>-pod-<container>`);
+  - di un Job valgono solo il template e la sua `restartPolicy`:
+    `backoffLimit`, `completions`, `parallelism` e `activeDeadlineSeconds`
+    sono ignorati. Un DaemonSet è un solo Pod, il server è uno;
+  - un Pod che finisce da solo (`restartPolicy` diversa da `Always`) porta
+    la unit a `inactive` se tutti i container escono con 0, a `failed`
+    altrimenti. `apply` e `restart` osservano la unit per 15 secondi: se in
+    quel tempo un container esce con errore falliscono e mostrano il log;
+  - finito il Job, podman rimuove il pod e `podman logs` non lo trova più:
+    i log restano nel journal, `journalctl --user CONTAINER_NAME=<container>`;
+  - il Job riparte a ogni `apply`, `restart` e riavvio del server: la unit è
+    abilitata all'avvio come quella di un Deployment.
 
 Per il resto si usa podman direttamente: `podman logs`, `podman exec`,
 `podman volume ls`.
+
+## Nomi globali sul server
+
+Podman non ha namespace: Secret, ConfigMap e PVC hanno un solo spazio di
+nomi per tutto l'utente `kubeset-lt`. Una Secret con lo stesso nome di
+quella di un altro progetto la sostituisce senza errore; ConfigMap, Secret
+montate e PVC diventano volumi con il loro nome, quindi una ConfigMap e un
+PVC di due progetti diversi possono finire sullo stesso volume.
+
+Per questo `apply` rifiuta lo stream, prima di toccare qualsiasi cosa, se un
+nome di Secret, ConfigMap o PVC è già usato da un altro progetto (la Secret
+del registry non conta, non arriva a podman). Conviene prefissare i nomi col
+progetto: `psa-backend-secrets`, `psa-backend-data`.
 
 ## Rollout: qualche secondo di disservizio
 

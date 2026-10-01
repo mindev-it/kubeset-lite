@@ -15,6 +15,7 @@ QUADLET=$HOME/.config/containers/systemd
 UNITS=$HOME/.config/systemd/user
 CADDY=$HOME/caddy
 ROLLOUT_TIMEOUT=180
+JOB_WATCH=15
 PODMAN_KINDS='["Pod","Deployment","DaemonSet","Job","PersistentVolumeClaim","ConfigMap","Secret"]'
 
 ACME_EMAIL=
@@ -35,6 +36,7 @@ project_dir() {
 }
 
 # "deployment/container" → nome del container creato da podman kube play.
+# docs: lo stream già trasformato per podman (Job e DaemonSet sono Pod).
 container_name() {
     local docs=$1 target=$2 owner container kind
     owner=${target%%/*}
@@ -49,7 +51,7 @@ container_name() {
 
 # Attende che le readinessProbe httpGet rispondano sulle porte pubblicate.
 rollout() {
-    local name=$1 dir=$QUADLET/$1 timeout deadline probes port path host
+    local name=$1 dir=$QUADLET/$1 timeout deadline probes port path host finite state
     # Come in Kubernetes: progressDeadlineSeconds del Deployment, il più alto.
     timeout=$(yq -s --argjson d "$ROLLOUT_TIMEOUT" '[.[] | .spec.progressDeadlineSeconds? // empty] | max // $d' "$dir/$name.yaml")
     deadline=$((SECONDS + timeout))
@@ -69,16 +71,51 @@ rollout() {
         log "attendo http://127.0.0.1:$host$path"
         until curl -fsS -o /dev/null --max-time 5 "http://127.0.0.1:$host$path" 2>/dev/null; do
             if systemctl --user -q is-failed "$name.service" || [ $SECONDS -ge $deadline ]; then
-                journalctl --user -u "$name.service" -n 30 --no-pager >&2 || true
-                systemctl --user stop "$name.service"
-                die "rollout di '$name' fallito: unit fermata"
+                rollout_failed "$name" "unit fermata"
             fi
             sleep 2
         done
     done <<< "$probes"
 
-    systemctl --user -q is-active "$name.service" || die "rollout di '$name' fallito: unit non attiva"
-    log "$name pronto"
+    # Pod che finiscono da soli (i Job): la unit si osserva per JOB_WATCH
+    # secondi, così un errore all'avvio fa fallire l'apply. Con
+    # ExitCodePropagation=any la unit diventa failed se un container esce
+    # con errore, inactive se escono tutti con 0.
+    finite=$(yq -s 'any(.[]; .kind == "Pod" and (.spec.restartPolicy // "Always") != "Always")' "$dir/$name.yaml")
+    if [ "$finite" = true ]; then
+        deadline=$((SECONDS + JOB_WATCH))
+        while [ $SECONDS -lt $deadline ] && systemctl --user -q is-active "$name.service"; do
+            sleep 1
+        done
+    fi
+    # Stati di passaggio, come deactivating mentre podman smonta il pod.
+    while state=$(systemctl --user show -P ActiveState "$name.service"); [[ "$state" == *activating ]]; do
+        sleep 1
+    done
+
+    case "$state" in
+        active) log "$name pronto" ;;
+        inactive)
+            [ "$finite" = true ] && [ "$(systemctl --user show -P Result "$name.service")" = success ] \
+                || rollout_failed "$name" "unit non attiva"
+            log "$name terminato senza errori"
+            ;;
+        failed)
+            [ "$finite" = true ] && rollout_failed "$name" "un container è uscito con errore"
+            rollout_failed "$name" "unit non attiva"
+            ;;
+        *) rollout_failed "$name" "unit non attiva" ;;
+    esac
+}
+
+# Mostra il journal dell'ultimo avvio della unit senza gli eventi di podman
+# (coprono l'output dei container), la ferma ed esce con errore.
+rollout_failed() {
+    local since
+    since=$(systemctl --user show -P InactiveExitTimestamp "$1.service")
+    { journalctl --user -u "$1.service" --since "${since:-today}" --no-pager | grep -v ' podman\[' | tail -n 30; } >&2 || true
+    systemctl --user stop "$1.service"
+    die "rollout di '$1' fallito: $2"
 }
 
 reload_caddy() {
@@ -104,7 +141,7 @@ prune_images() {
 }
 
 cmd_apply() {
-    local work name dir docs images img cron on exec_target timeout container cmd unit caddy_file sites
+    local work name dir docs images img cron on exec_target timeout container cmd unit caddy_file sites names f other used
 
     work=$(mktemp -d -p "${XDG_RUNTIME_DIR:?manca XDG_RUNTIME_DIR}" kubeset-lt.XXXXXX)
     trap "rm -rf '$work'" EXIT
@@ -131,17 +168,19 @@ cmd_apply() {
         [[ "$p" =~ ^[0-9]+$ ]] || die "sites: porta non valida '$p'"
     done
 
-    # Cron: tutto validato prima di toccare qualsiasi cosa.
-    jq -c '.spec.cron // {} | to_entries[]' "$work/project.json" > "$work/cron.jsonl"
-    while read -r cron; do
-        c=$(jq -r '.key' <<< "$cron")
-        [[ "$c" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || die "nome cron non valido: '$c'"
-        on=$(jq -r '.value.on // empty' <<< "$cron")
-        systemd-analyze calendar "$on" >/dev/null 2>&1 || die "cron $c: on non valido: '$on'"
-        exec_target=$(jq -r '.value.exec // empty' <<< "$cron")
-        [ -n "$exec_target" ] || die "cron $c: manca exec"
-        container_name "$docs" "${exec_target%% *}" >/dev/null
-    done < "$work/cron.jsonl"
+    # Podman non ha namespace: Secret, ConfigMap e PVC hanno nomi globali
+    # per l'utente. ConfigMap, Secret montate e PVC diventano volumi con lo
+    # stesso nome, quindi si confronta l'insieme dei nomi, non per kind.
+    names=$(jq -r '.[] | select(.kind == "ConfigMap" or .kind == "PersistentVolumeClaim"
+        or (.kind == "Secret" and .type != "kubernetes.io/dockerconfigjson")) | .metadata.name' "$docs" | sort -u)
+    for f in "$QUADLET"/*/*.yaml; do
+        [ -f "$f" ] || continue
+        other=$(basename "$(dirname "$f")")
+        [ "$other" != "$name" ] || continue
+        used=$(yq -r 'select(.kind == "ConfigMap" or .kind == "PersistentVolumeClaim" or .kind == "Secret") | .metadata.name' "$f" \
+            | sort -u | comm -12 - <(echo "$names"))
+        [ -z "$used" ] || die "nomi già usati dal progetto '$other': $(echo $used) (Secret, ConfigMap e PVC sono globali sul server)"
+    done
 
     # Credenziali del registry: solo in $work, cancellate dal trap.
     mkdir -p "$work/docker"
@@ -155,6 +194,10 @@ cmd_apply() {
 
     # Trasformazioni per podman:
     # - via Project e credenziali del registry;
+    # - Job e DaemonSet diventano Pod: con --service-container=true (Quadlet)
+    #   podman crea il service container solo per Pod e Deployment, e con un
+    #   Job o un DaemonSet va in panic (podman 5.7, pkg/domain/infra/abi/play.go).
+    #   Da togliere quando podman lo corregge: vedi plan.md;
     # - imagePullPolicy: Never, così dopo il pull non serve più il registry;
     # - i PVC prendono uid/gid dal securityContext del pod che li monta,
     #   altrimenti podman crea il volume di root (vale solo alla creazione).
@@ -169,11 +212,31 @@ cmd_apply() {
           ] | from_entries) as $owners
         | [.[]
         | select(.kind != "Project" and (.kind != "Secret" or .type != "kubernetes.io/dockerconfigjson"))
+        | if .kind == "Job" or .kind == "DaemonSet" then
+              {apiVersion: "v1", kind: "Pod",
+               metadata: ({name: .metadata.name,
+                           labels: ((.metadata.labels // {}) + (.spec.template.metadata.labels // {})),
+                           annotations: ((.metadata.annotations // {}) + (.spec.template.metadata.annotations // {}))}
+                          | with_entries(select(.value != {}))),
+               spec: .spec.template.spec}
+          else . end
         | if .kind == "PersistentVolumeClaim" then
               .metadata.annotations = (($owners[.metadata.name] // {}) + (.metadata.annotations // {}))
           else . end
         | walk(if type == "object" and has("image") and has("name") then .imagePullPolicy = "Never" else . end)]' \
         "$docs" > "$work/podman.json"
+
+    # Cron: tutto validato prima di toccare qualsiasi cosa.
+    jq -c '.spec.cron // {} | to_entries[]' "$work/project.json" > "$work/cron.jsonl"
+    while read -r cron; do
+        c=$(jq -r '.key' <<< "$cron")
+        [[ "$c" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || die "nome cron non valido: '$c'"
+        on=$(jq -r '.value.on // empty' <<< "$cron")
+        systemd-analyze calendar "$on" >/dev/null 2>&1 || die "cron $c: on non valido: '$on'"
+        exec_target=$(jq -r '.value.exec // empty' <<< "$cron")
+        [ -n "$exec_target" ] || die "cron $c: manca exec"
+        container_name "$work/podman.json" "${exec_target%% *}" >/dev/null
+    done < "$work/cron.jsonl"
 
     # 2. Pull. Se fallisce non si è toccato niente.
     images=$(jq -r '[.[] | .. | objects | select(has("image") and has("name")) | .image] | unique | .[]' "$work/podman.json")
@@ -198,6 +261,8 @@ cmd_apply() {
         echo
         echo "[Kube]"
         echo "Yaml=$name.yaml"
+        # Un Job che esce con errore lascia la unit failed, non inactive.
+        echo "ExitCodePropagation=any"
         jq -r '.spec.publish[]? | "PublishPort=127.0.0.1:" + .' "$work/project.json"
         echo
         echo "[Install]"
@@ -206,7 +271,8 @@ cmd_apply() {
 
     systemctl --user daemon-reload
     log "avvio $name.service"
-    systemctl --user restart "$name.service"
+    # Se l'avvio fallisce, il journal lo mostra rollout.
+    systemctl --user restart "$name.service" || true
     rollout "$name"
 
     # 4. Cron, solo dopo un rollout riuscito.
@@ -217,7 +283,7 @@ cmd_apply() {
         on=$(jq -r '.value.on' <<< "$cron")
         exec_target=$(jq -r '.value.exec' <<< "$cron")
         timeout=$(jq -r '.value.timeout // "infinity"' <<< "$cron")
-        container=$(container_name "$docs" "${exec_target%% *}")
+        container=$(container_name "$work/podman.json" "${exec_target%% *}")
         cmd=${exec_target#* }
         unit=kubeset-lt-${name}_$c
         wanted+="$unit "
@@ -289,7 +355,8 @@ EOF
 cmd_restart() {
     local name=$1
     project_dir "$name" >/dev/null
-    systemctl --user restart "$name.service"
+    # Se l'avvio fallisce, il journal lo mostra rollout.
+    systemctl --user restart "$name.service" || true
     rollout "$name"
 }
 
@@ -317,9 +384,20 @@ cmd_secret() {
 }
 
 cmd_delete() {
-    local name=$1 f
+    local name=$1 f v vols
     project_dir "$name" >/dev/null
+    # Volumi che podman crea per le ConfigMap e le Secret montate: copie dei
+    # dati dello YAML (le Secret in chiaro), non restano. I PVC sì.
+    vols=$(yq -r -s '[.[] | select(.kind == "PersistentVolumeClaim") | .metadata.name] as $pvc
+        | [.[] | (.spec.template.spec? // .spec?) | objects | .volumes[]?
+           | .configMap.name? // .secret.secretName? // empty]
+        | unique - $pvc | .[]' "$QUADLET/$name/$name.yaml")
     systemctl --user stop "$name.service" || true
+    systemctl --user reset-failed "$name.service" 2>/dev/null || true
+    for v in $vols; do
+        podman volume exists "$v" || continue
+        podman volume rm "$v" >/dev/null || log "volume $v non rimosso"
+    done
     for f in "$UNITS/kubeset-lt-${name}_"*.timer; do
         [ -f "$f" ] || continue
         systemctl --user disable --now "$(basename "$f")" 2>/dev/null || true
@@ -332,7 +410,7 @@ cmd_delete() {
         reload_caddy
     fi
     prune_images
-    log "$name rimosso (i volumi restano: podman volume ls)"
+    log "$name rimosso (i volumi dei PVC restano: podman volume ls)"
 }
 
 case "${1:-}" in

@@ -294,3 +294,49 @@ all'agente main, non si modifica il manifest.
   - psa: `deploy.sh` (k3s) non funziona più finché non si cambia
     `GIT_BRANCH` in `main`;
   - skill per i DNS OVH, con chiavi lette all'occorrenza.
+
+## Stato al 01/10
+
+- Deploy di oci-a1-hunter (un Job) su host4 fallito. Causa, dal journal e
+  dal sorgente di podman 5.7.0 (`pkg/domain/infra/abi/play.go`): con
+  `--service-container=true`, quello che usa Quadlet, podman crea il service
+  container solo se il kind è `Pod` o `Deployment` (riga 330); con un Job o
+  un DaemonSet resta nil e alla riga 505 `serviceContainer.Inspect(false)`
+  va in panic. C'è anche su podman main.
+- Correzione: `apply` trasforma Job e DaemonSet in Pod (`spec` del
+  template, label e annotation unite). Il `.kube` ha
+  `ExitCodePropagation=any`. Provato sulla VM (podman 5.4.2):
+  - Pod `restartPolicy: Never` che esce con 0: unit `inactive`,
+    `Result=success`; con 3: `failed`, `Result=exit-code`. Uno stop a mano,
+    sia con `Never` sia con `Always`: `inactive`, `Result=success`;
+  - Job con ConfigMap montata, Secret montata e Secret in `envFrom`, 2
+    minuti di `sleep`: apply riuscito in 18 secondi (15 di osservazione),
+    container `kt-job-main` attivo, a fine Job unit `inactive`, pod rimosso,
+    output ancora in `journalctl --user CONTAINER_NAME=kt-job-main`;
+  - Job di 3 secondi: apply riuscito con "terminato senza errori";
+  - Job che esce subito con 1: apply fallito, nel log c'è l'output del
+    container, status `failed`;
+  - DaemonSet con un cron in `exec`: pod `kt-ds`, container `kt-ds-main`,
+    il cron gira.
+- Podman non ha namespace (sorgente 5.7): `playKubeSecret` sostituisce in
+  silenzio una Secret con lo stesso nome; per i volumi `configMap` e
+  `secret` crea un volume con il nome della ConfigMap/Secret, lo riusa se
+  c'è e non lo cancella allo stop (verificato sulla VM: la Secret montata
+  resta in chiaro in `volumes/<nome>/_data`); i PVC sono volumi con il loro
+  nome. Quindi:
+  - `apply` rifiuta, prima di toccare qualsiasi cosa, un nome di Secret,
+    ConfigMap o PVC già usato da un altro progetto: provato con una
+    ConfigMap `kt-data` contro il PVC `kt-data` di un altro progetto, niente
+    creato;
+  - `delete` cancella i volumi delle ConfigMap e Secret montate: provato,
+    `kt-script` e `kt-key` spariti, il PVC `kt-data` restato.
+- Restano:
+  - quando podman crea il service container anche per Job e DaemonSet,
+    togliere la trasformazione in Pod da `apply` (e il paragrafo del
+    README): oggi c'è ancora su main;
+  - i nomi dei pod sono globali anche loro: per la documentazione `kube
+    play --replace` sostituisce un pod con lo stesso nome, anche di un altro
+    progetto. Non provato e non controllato;
+  - oci-a1-hunter: nel suo README `podman logs -f a1-hunter-1-pod-hunter`
+    diventa `a1-hunter-1-hunter`, e a Job finito i log sono solo nel
+    journal.
